@@ -1,0 +1,85 @@
+#!/bin/bash
+# Script to run test actions.
+
+DIR=/tmp/logtest
+LOGDIR=$DIR/log
+INPUT=$LOGDIR/test.log   # Log file tailed by fluentd.
+OUTPUT=$DIR/test.out
+
+restart() {
+    pkill -9 -f fluent
+    rm -rf $DIR
+    mkdir -p $LOGDIR
+    touch $INPUT
+    rm -f nohup.out
+    file-metric $LOGDIR&
+    cat > $DIR/fluent.conf <<EOF
+<source>
+  @type tail
+  path $INPUT
+  format none
+  tag test
+
+while
+  enable_stat_watcher true      # Explicitly enable inotify
+  enable_watch_timer false 	# Get rid of timer overhead,  not needed with inotify
+  rotate_wait ${ROTATE_WAIT:-0} # Don't hold on to old files, CRI-O flushes before rotation
+</source>
+
+<match test.**>
+  @type file
+  append true
+  path $OUTPUT
+  <buffer>
+    @type memory
+    flush_mode immediate
+  </buffer>
+</match>
+EOF
+    # FIXME(alanconway) There is something fishy going on with fluentd in these tests.
+    # It collects a huge number of open FDs to the same test.log file.
+    # Increase ulimit to proceed, but need to investigate.
+    ulimit -n 10000		# Some experiments ran out of fds.
+    exec fluentd -c $DIR/fluent.conf
+}
+
+rotate() {
+    # Hard link the rotated file to keep it
+    ln $INPUT $DIR/rotated.$(date +%s.%N)
+    # mv instead of rm so the file name is never non-existent.
+    mv $(mktemp) $INPUT
+}
+
+write() {
+    local TOTAL=${1:-100} DELAY=${2:-0} TAG=${3:-""} N=0
+    while [ $N -lt $TOTAL ]; do
+	echo "$TAG $N $(date) this is informative information! " >> $INPUT
+	N=$(( N + 1 ))
+	sleep $DELAY
+    done
+}
+
+rotate_loop() {
+    local TOTAL=${1:- 100} DELAY=${2:-0} N=0
+    while [ $N -lt $TOTAL ]; do
+	echo "rotate loop $N (delay $DELAY)"
+	N=$(( N + 1 ))
+	write 10 0 series-$N
+	rotate
+	sleep $DELAY
+	echo "rotate loop $N (delay $DELAY)"
+    done
+    metrics
+}
+
+metrics() {
+    echo "fluentd files open $(fluentd_open | grep $INPUT | wc -l)"
+    echo "rotated + log file: $(wc -c $DIR/rotated.* $INPUT | tail -n1)"
+    echo "metric: $(curl -s localhost:2112/metrics | grep 'bytes_logged{')"
+}
+
+lsof_fluentd() {
+   lsof -p $(pgrep -f 'fluentd.*supervisor')
+}
+
+"$@"
